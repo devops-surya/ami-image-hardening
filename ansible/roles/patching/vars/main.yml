@@ -1,0 +1,5 @@
+---
+# Patching configuration
+security_only_updates: true
+auto_reboot: false
+reboot_timeout: 300

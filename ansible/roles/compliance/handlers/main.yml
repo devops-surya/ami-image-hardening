@@ -1,0 +1,16 @@
+# ansible/roles/compliance/handlers/main.yml
+---
+- name: reload auditd rules
+  command: augenrules --load
+  failed_when: false
+
+- name: move aide database
+  command: mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+  args:
+    creates: /var/lib/aide/aide.db.gz
+
+- name: restart fail2ban
+  service:
+    name: fail2ban
+    state: restarted
+  failed_when: false

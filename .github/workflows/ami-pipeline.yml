@@ -1,0 +1,348 @@
+name: AMI Security Pipeline
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+  AWS_DEFAULT_REGION: ap-south-1
+  ANSIBLE_HOST_KEY_CHECKING: "False"
+
+jobs:
+  fetch-latest-ami:
+    runs-on: ubuntu-latest
+    outputs:
+      base_ami: ${{ steps.fetch.outputs.rhel_ami }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch latest RHEL AMI
+        id: fetch
+        run: |
+          mkdir -p reports
+          chmod +x scripts/fetch_ami.sh
+          ./scripts/fetch_ami.sh ./reports
+
+          AMI_ID=$(jq -r '.amis.rhel.ami_id' reports/latest_amis.json)
+
+          if [ -z "$AMI_ID" ] || [ "$AMI_ID" = "null" ]; then
+            echo "Unable to fetch latest RHEL AMI"
+            exit 1
+          fi
+
+          echo "rhel_ami=$AMI_ID" >> $GITHUB_OUTPUT
+          echo "Latest RHEL AMI: $AMI_ID"
+
+  harden-with-ansible:
+    needs: fetch-latest-ami
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    outputs:
+      hardened_ami_id: ${{ steps.create_ami.outputs.hardened_ami_id }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Ansible
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible boto3 botocore
+          ansible-galaxy collection install community.general amazon.aws
+
+      - name: Prepare SSH key
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > private_key.pem
+          chmod 600 private_key.pem
+
+      - name: Launch base EC2 instance
+        id: launch
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --region ${{ env.AWS_REGION }} \
+            --image-id ${{ needs.fetch-latest-ami.outputs.base_ami }} \
+            --instance-type t3.medium \
+            --key-name ami-hardening \
+            --associate-public-ip-address \
+            --security-group-ids ${{ secrets.SECURITY_GROUP_ID }} \
+            --subnet-id ${{ secrets.SUBNET_ID }} \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=AMI-Hardening-Ansible}]' \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+
+          aws ec2 wait instance-running \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $INSTANCE_ID
+
+          INSTANCE_IP=$(aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids $INSTANCE_ID \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+
+          echo "instance_ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
+          echo "Instance IP: $INSTANCE_IP"
+
+          sleep 90
+
+      - name: Wait for SSH
+        run: |
+          for i in {1..30}; do
+            if ssh -o StrictHostKeyChecking=no \
+              -i private_key.pem \
+              -o ConnectTimeout=5 \
+              ec2-user@${{ steps.launch.outputs.instance_ip }} "echo SSH ready"; then
+              echo "SSH is ready"
+              exit 0
+            fi
+
+            echo "Waiting for SSH... $i/30"
+            sleep 10
+          done
+
+          echo "SSH not ready"
+          exit 1
+
+      - name: Create Ansible inventory
+        run: |
+          cat > ansible/inventory.ini << EOF
+          [ami_target]
+          ${{ steps.launch.outputs.instance_ip }} ansible_user=ec2-user ansible_ssh_private_key_file=../private_key.pem ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          EOF
+
+      - name: Run Ansible hardening playbook
+        run: |
+          cd ansible
+          ansible-playbook -i inventory.ini playbook.yml
+
+      - name: Stop hardened instance before AMI creation
+        run: |
+          aws ec2 stop-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids ${{ steps.launch.outputs.instance_id }}
+
+          aws ec2 wait instance-stopped \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids ${{ steps.launch.outputs.instance_id }}
+
+      - name: Create hardened AMI
+        id: create_ami
+        run: |
+          BUILD_ID=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          DATE=$(date +%Y%m%d%H%M)
+
+          AMI_NAME="rhel-hardened-${DATE}-${BUILD_ID}"
+
+          AMI_ID=$(aws ec2 create-image \
+            --region ${{ env.AWS_REGION }} \
+            --instance-id ${{ steps.launch.outputs.instance_id }} \
+            --name "$AMI_NAME" \
+            --description "RHEL hardened AMI created by Ansible from GitHub Actions run ${{ github.run_id }}" \
+            --no-reboot \
+            --query 'ImageId' \
+            --output text)
+
+          echo "hardened_ami_id=$AMI_ID" >> $GITHUB_OUTPUT
+          echo "Created AMI: $AMI_ID"
+
+          aws ec2 wait image-available \
+            --region ${{ env.AWS_REGION }} \
+            --image-ids $AMI_ID
+
+      - name: Cleanup hardening instance
+        if: always()
+        run: |
+          if [ -n "${{ steps.launch.outputs.instance_id }}" ]; then
+            aws ec2 terminate-instances \
+              --region ${{ env.AWS_REGION }} \
+              --instance-ids ${{ steps.launch.outputs.instance_id }}
+          fi
+
+          rm -f private_key.pem
+
+  vulnerability-scan:
+    needs: harden-with-ansible
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prepare SSH key and reports
+        run: |
+          mkdir -p reports
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > private_key.pem
+          chmod 600 private_key.pem
+
+      - name: Launch scan instance from hardened AMI
+        id: scan_instance
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --region ${{ env.AWS_REGION }} \
+            --image-id ${{ needs.harden-with-ansible.outputs.hardened_ami_id }} \
+            --instance-type t3.medium \
+            --key-name ami-hardening \
+            --associate-public-ip-address \
+            --security-group-ids ${{ secrets.SECURITY_GROUP_ID }} \
+            --subnet-id ${{ secrets.SUBNET_ID }} \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=AMI-Trivy-Scan}]' \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+
+          aws ec2 wait instance-running \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids "$INSTANCE_ID"
+
+          INSTANCE_IP=$(aws ec2 describe-instances \
+            --region ${{ env.AWS_REGION }} \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+
+          echo "instance_ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
+          sleep 90
+
+      - name: Wait for SSH
+        run: |
+          for i in {1..30}; do
+            if ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -i private_key.pem \
+              -o ConnectTimeout=5 \
+              ec2-user@${{ steps.scan_instance.outputs.instance_ip }} "echo SSH ready"; then
+              exit 0
+            fi
+
+            echo "Waiting for SSH... $i/30"
+            sleep 10
+          done
+
+          exit 1
+
+      - name: Install Trivy on scan instance
+        run: |
+          ssh -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -i private_key.pem \
+            ec2-user@${{ steps.scan_instance.outputs.instance_ip }} << 'EOF'
+          sudo tee /etc/yum.repos.d/trivy.repo > /dev/null << 'REPO'
+          [trivy]
+          name=Trivy
+          baseurl=https://aquasecurity.github.io/trivy-repo/rpm/releases/9/x86_64/
+          gpgcheck=0
+          enabled=1
+          REPO
+
+          sudo yum clean all
+          sudo yum makecache -y
+          sudo yum install -y trivy
+          trivy --version
+          EOF
+
+      - name: Run Trivy scan
+        id: trivy_scan
+        run: |
+          mkdir -p ./reports
+          python scripts/run_trivy_scan.py \
+            --instance-ip "${{ steps.scan_instance.outputs.instance_ip }}" \
+            --private-key private_key.pem \
+            --output-dir "$(pwd)/reports"
+
+      - name: Tag AMI based on scan result
+        continue-on-error: true
+        run: |
+          AMI_ID="${{ needs.harden-with-ansible.outputs.hardened_ami_id }}"
+          TOTAL="${{ steps.trivy_scan.outputs.total_vulnerabilities }}"
+          CRITICAL="${{ steps.trivy_scan.outputs.critical_count }}"
+          HIGH="${{ steps.trivy_scan.outputs.high_count }}"
+
+          TOTAL="${TOTAL:-0}"
+          CRITICAL="${CRITICAL:-0}"
+          HIGH="${HIGH:-0}"
+
+          if [ "$CRITICAL" = "0" ]; then
+            echo "Scan clean. Tagging AMI as approved/latest."
+
+            aws ec2 create-tags \
+              --region ${{ env.AWS_REGION }} \
+              --resources "$AMI_ID" \
+              --tags \
+                Key=hardened,Value=true \
+                Key=security,Value=passed \
+                Key=scan-status,Value=clean \
+                Key=approved,Value=true \
+                Key=latest,Value=true \
+                Key=scanned-by,Value=Trivy \
+                Key=scan-date,Value=$(date +%Y-%m-%d)
+
+          else
+            echo "Critical Vulnerabilities found. AMI will be retained, but not tagged as approved/latest."
+
+            aws ec2 create-tags \
+              --region ${{ env.AWS_REGION }} \
+              --resources "$AMI_ID" \
+              --tags \
+                Key=hardened,Value=true \
+                Key=security,Value=failed \
+                Key=scan-status,Value=vulnerable \
+                Key=approved,Value=false \
+                Key=latest,Value=false \
+                Key=vulnerability-count,Value=$TOTAL \
+                Key=critical-count,Value=$CRITICAL \
+                Key=high-count,Value=$HIGH \
+                Key=scanned-by,Value=Trivy \
+                Key=scan-date,Value=$(date +%Y-%m-%d)
+          fi
+
+      - name: Cleanup scan instance
+        if: always()
+        run: |
+          if [ -n "${{ steps.scan_instance.outputs.instance_id }}" ]; then
+            aws ec2 terminate-instances \
+              --region ${{ env.AWS_REGION }} \
+              --instance-ids ${{ steps.scan_instance.outputs.instance_id }}
+          fi
+
+          rm -f private_key.pem
+
+      - name: Debug reports folder
+        if: always()
+        run: |
+          ls -la ./reports || true
+
+      - name: Upload scan reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-reports-${{ github.run_id }}
+          path: ./reports/
+          retention-days: 30

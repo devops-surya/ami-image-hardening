@@ -1,0 +1,103 @@
+---
+- name: Ensure audit package is installed
+  package:
+    name: audit
+    state: present
+  tags: auditd
+
+- name: Ensure auditd service is enabled and running
+  systemd:
+    name: auditd
+    enabled: yes
+    state: started
+  tags: auditd
+
+- name: Deploy audit rules
+  template:
+    src: audit.rules.j2
+    dest: /etc/audit/rules.d/audit.rules
+    owner: root
+    group: root
+    mode: '0640'
+  notify: reload auditd rules
+  tags: audit
+
+- name: Install and configure AIDE
+  package:
+    name: aide
+    state: present
+  tags: aide
+
+- name: Initialize AIDE database
+  command: aide --init
+  args:
+    creates: /var/lib/aide/aide.db.new.gz
+  notify: move aide database
+  tags: aide
+
+- name: Install fail2ban if available
+  package:
+    name: fail2ban
+    state: present
+  register: fail2ban_install
+  failed_when: false
+  tags: fail2ban
+
+- name: Ensure fail2ban directory exists
+  file:
+    path: /etc/fail2ban
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  when:
+    - fail2ban_install is defined
+    - fail2ban_install.rc is defined
+    - fail2ban_install.rc == 0
+  tags: fail2ban
+
+- name: Configure fail2ban jail
+  template:
+    src: jail.local.j2
+    dest: /etc/fail2ban/jail.local
+    owner: root
+    group: root
+    mode: '0644'
+  when:
+    - fail2ban_install is defined
+    - fail2ban_install.rc is defined
+    - fail2ban_install.rc == 0
+  notify: restart fail2ban
+  tags: fail2ban
+
+- name: Configure logrotate for security logs
+  template:
+    src: logrotate.conf.j2
+    dest: /etc/logrotate.d/security
+    mode: '0644'
+  tags: logging
+
+- name: Check for compliance with CIS benchmarks
+  command: aide --check
+  register: aide_check
+  changed_when: false
+  failed_when: false
+  tags: verification
+
+- name: Generate compliance report
+  copy:
+    dest: /var/log/compliance_report_{{ ansible_date_time.epoch }}.txt
+    mode: '0644'
+    content: |
+      ====================================
+      Compliance Report
+      ====================================
+      Date: {{ ansible_date_time.iso8601 }}
+      Host: {{ ansible_hostname }}
+      OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      Kernel: {{ ansible_kernel }}
+      AIDE Status: {{ 'PASS' if aide_check.rc == 0 else 'FAIL' if aide_check.rc == 1 else 'ERROR' }}
+      Auditd: enabled
+      Compliance Level: CIS Level 1
+      ====================================
+  tags: reporting

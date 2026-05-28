@@ -1,0 +1,21 @@
+---
+- name: restart critical services
+  service:
+    name: "{{ item }}"
+    state: restarted
+  loop:
+    - sshd
+    - chronyd
+    - rsyslog
+  failed_when: false
+
+- name: reboot required
+  set_fact:
+    reboot_required: true
+
+- name: start qualys agent
+  service:
+    name: qualys-cloud-agent
+    state: started
+    enabled: yes
+  failed_when: false
