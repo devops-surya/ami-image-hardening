@@ -3,7 +3,7 @@
 # Script to fetch latest AMI IDs from ap-south-1 region
 set -euo pipefail
 
-AWS_REGION="ap-south-1"
+AWS_REGION="us-east-1"
 OUTPUT_DIR="${1:-./reports}"
 
 mkdir -p "$OUTPUT_DIR"
