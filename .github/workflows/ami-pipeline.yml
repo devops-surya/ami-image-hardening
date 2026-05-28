@@ -79,7 +79,7 @@ jobs:
             --region ${{ env.AWS_REGION }} \
             --image-id ${{ needs.fetch-latest-ami.outputs.base_ami }} \
             --instance-type t3.medium \
-            --key-name ami-hardening \
+            --key-name saikp \
             --associate-public-ip-address \
             --security-group-ids ${{ secrets.SECURITY_GROUP_ID }} \
             --subnet-id ${{ secrets.SUBNET_ID }} \
@@ -208,7 +208,7 @@ jobs:
             --region ${{ env.AWS_REGION }} \
             --image-id ${{ needs.harden-with-ansible.outputs.hardened_ami_id }} \
             --instance-type t3.medium \
-            --key-name ami-hardening \
+            --key-name saikp \
             --associate-public-ip-address \
             --security-group-ids ${{ secrets.SECURITY_GROUP_ID }} \
             --subnet-id ${{ secrets.SUBNET_ID }} \
